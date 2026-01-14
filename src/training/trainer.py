@@ -73,7 +73,14 @@ def train_phase1(
         k_shot=10,
         q_query=10,
         device='cuda' if torch.cuda.is_available() else 'cpu',
-        resume_from=None
+        resume_from=None,
+        # Phase 2 新增参数
+        use_phase2=False,
+        tissue_source='Inferred_Tissue',
+        phase1_epochs=50,
+        phase2_epochs=50,
+        finetune_epochs=20,
+        train_path=None
 ):
     """
     Phase 1完整训练流程
@@ -91,13 +98,21 @@ def train_phase1(
         n_way, k_shot, q_query: MAML episode参数
         device: 设备
         resume_from: 从checkpoint恢复
+        # Phase 2 新增参数
+        use_phase2: 启用Phase 2 (HLA×Tissue)
+        tissue_source: 组织来源列名
+        phase1_epochs: Phase 1训练轮数
+        phase2_epochs: Phase 2训练轮数
+        finetune_epochs: 微调轮数
+        train_path: 训练数据路径（Phase 2专用）
 
     Returns:
         model: 训练好的模型
         history: 训练历史
     """
     print("=" * 80)
-    print(f"Phase 1 训练 {'(MAML)' if use_maml else '(Standard)'}")
+    print(f"Phase 1 训练 {'(MAML)' if use_maml else '(Standard)'}" +
+          f"{' + Phase 2 (HLA×Tissue)' if use_phase2 else ''}")
     print("=" * 80)
     print(f"Device: {device}")
 
@@ -110,11 +125,41 @@ def train_phase1(
     print("加载数据...")
     print("=" * 80)
 
-    train_loader, val_loader, test_loader = create_dataloaders(
-        dataset_dir=dataset_dir,
-        batch_size=batch_size,
-        meta_learning=False
-    )
+    # 位置2: 数据加载逻辑修改（Phase 2 数据加载）
+    if use_phase2:
+        from src.data.dataset import ImmuneAppDatasetWithTissue
+        from src.data.task_creator import create_phase2_tasks
+
+        # 加载带组织信息的数据
+        train_dataset = ImmuneAppDatasetWithTissue(
+            train_path,
+            tissue_source=tissue_source
+        )
+        train_data = train_dataset.get_dataframe()
+
+        # 创建Phase 1和Phase 2任务
+        tasks = create_phase2_tasks(
+            train_data,
+            phase='combined',  # 同时创建Phase 1和Phase 2
+            min_samples_phase1=20,
+            min_samples_phase2=10
+        )
+
+        # 为了兼容后续逻辑，创建空的dataloader（实际由Phase 2 trainer处理）
+        train_loader, val_loader, test_loader = None, None, None
+        # 加载测试集（Phase 2）
+        test_dataset = ImmuneAppDatasetWithTissue(
+            Path(dataset_dir) / 'test.csv',
+            tissue_source=tissue_source
+        )
+    else:
+        # 原有的Phase 1数据加载逻辑
+        train_loader, val_loader, test_loader = create_dataloaders(
+            dataset_dir=dataset_dir,
+            batch_size=batch_size,
+            meta_learning=False
+        )
+        test_dataset = None
 
     # 加载Task Graph
     graph_wrapper = TaskGraphWrapper(
@@ -152,36 +197,70 @@ def train_phase1(
     history = {'train_loss': [], 'val_loss': [], 'val_auroc': [], 'val_auprc': []}
     best_val_auroc = 0.0
 
-    if use_maml:
-        trainer = MAMLTrainer(
-            model=model,
+    # 位置3: 训练器选择逻辑修改（Phase 2 训练器）
+    if use_phase2:
+        # 创建基础MAML trainer
+        base_trainer = MAMLTrainer(
+            model,
             inner_lr=inner_lr,
             meta_lr=meta_lr,
-            inner_steps=inner_steps,
-            first_order=False
+            inner_steps=inner_steps
         )
 
-        # 包装DataLoader为MAML格式
-        maml_train_loader = MAMLDataLoader(
-            train_loader,
-            n_way=n_way,
-            k_shot=k_shot,
-            q_query=q_query
+        # 包装为Phase 2 trainer
+        from src.training.maml import MAMLTrainerPhase2
+        trainer = MAMLTrainerPhase2(
+            base_trainer=base_trainer,
+            tasks=tasks,
+            graph_wrapper=graph_wrapper,
+            device=device,
+            max_len=15
         )
 
+        # 渐进式训练
+        history = trainer.progressive_train(
+            phase1_epochs=phase1_epochs,
+            phase2_epochs=phase2_epochs,
+            finetune_epochs=finetune_epochs,
+            n_way=5,
+            k_shot=10,
+            q_query=10,
+            episodes_per_epoch=100
+        )
         optimizer = None
         criterion = None
-    else:
-        trainer = None
         maml_train_loader = None
-        optimizer = optim.Adam(model.parameters(), lr=meta_lr)
-        criterion = nn.BCEWithLogitsLoss()
+    else:
+        if use_maml:
+            trainer = MAMLTrainer(
+                model=model,
+                inner_lr=inner_lr,
+                meta_lr=meta_lr,
+                inner_steps=inner_steps,
+                first_order=False
+            )
+
+            # 包装DataLoader为MAML格式
+            maml_train_loader = MAMLDataLoader(
+                train_loader,
+                n_way=n_way,
+                k_shot=k_shot,
+                q_query=q_query
+            )
+
+            optimizer = None
+            criterion = None
+        else:
+            trainer = None
+            maml_train_loader = None
+            optimizer = optim.Adam(model.parameters(), lr=meta_lr)
+            criterion = nn.BCEWithLogitsLoss()
 
     # 创建评估器
     evaluator = Evaluator(criterion=nn.BCEWithLogitsLoss())
 
     # === 4. 从checkpoint恢复 ===
-    if resume_from and Path(resume_from).exists():
+    if resume_from and Path(resume_from).exists() and not use_phase2:
         print(f"\n从checkpoint恢复: {resume_from}")
         checkpoint = torch.load(resume_from)
         model.load_state_dict(checkpoint['model_state_dict'])
@@ -194,82 +273,99 @@ def train_phase1(
 
         print(f"✓ 恢复成功！从epoch {start_epoch}继续训练")
 
-    # === 5. 训练循环 ===
-    print("\n" + "=" * 80)
-    print("开始训练...")
-    print("=" * 80)
+    # === 5. 训练循环（仅Phase 1）===
+    if not use_phase2:
+        print("\n" + "=" * 80)
+        print("开始训练...")
+        print("=" * 80)
 
-    for epoch in range(start_epoch, n_epochs):
-        print(f"\n{'=' * 80}")
-        print(f"Epoch {epoch + 1}/{n_epochs}")
-        print(f"{'=' * 80}")
+        for epoch in range(start_epoch, n_epochs):
+            print(f"\n{'=' * 80}")
+            print(f"Epoch {epoch + 1}/{n_epochs}")
+            print(f"{'=' * 80}")
 
-        # 训练
-        if use_maml:
-            train_metrics = train_maml_epoch(
-                trainer, maml_train_loader, graph_wrapper, device
+            # 训练
+            if use_maml:
+                train_metrics = train_maml_epoch(
+                    trainer, maml_train_loader, graph_wrapper, device
+                )
+            else:
+                train_metrics = train_standard_epoch(
+                    model, train_loader, optimizer, criterion, graph_wrapper, device
+                )
+
+            # 验证
+            val_metrics = evaluator.evaluate(
+                model, val_loader, graph_wrapper, device
             )
-        else:
-            train_metrics = train_standard_epoch(
-                model, train_loader, optimizer, criterion, graph_wrapper, device
-            )
 
-        # 验证
-        val_metrics = evaluator.evaluate(
-            model, val_loader, graph_wrapper, device
-        )
+            # 记录历史
+            history['train_loss'].append(train_metrics['loss'])
+            history['val_loss'].append(val_metrics['loss'])
+            history['val_auroc'].append(val_metrics['auroc'])
+            history['val_auprc'].append(val_metrics['auprc'])
 
-        # 记录历史
-        history['train_loss'].append(train_metrics['loss'])
-        history['val_loss'].append(val_metrics['loss'])
-        history['val_auroc'].append(val_metrics['auroc'])
-        history['val_auprc'].append(val_metrics['auprc'])
+            # 打印指标
+            print(f"\nTrain Loss: {train_metrics['loss']:.4f}")
+            if use_maml:
+                print(f"  Support Loss: {train_metrics.get('support_loss', 0):.4f}")
+            print(f"Val Loss: {val_metrics['loss']:.4f}")
+            print(f"Val AUROC: {val_metrics['auroc']:.4f}")
+            print(f"Val AUPRC: {val_metrics['auprc']:.4f}")
+            print(f"Val PPV@100: {val_metrics['ppv']:.4f}")
 
-        # 打印指标
-        print(f"\nTrain Loss: {train_metrics['loss']:.4f}")
-        if use_maml:
-            print(f"  Support Loss: {train_metrics.get('support_loss', 0):.4f}")
-        print(f"Val Loss: {val_metrics['loss']:.4f}")
-        print(f"Val AUROC: {val_metrics['auroc']:.4f}")
-        print(f"Val AUPRC: {val_metrics['auprc']:.4f}")
-        print(f"Val PPV@100: {val_metrics['ppv']:.4f}")
+            # 保存最佳模型
+            if val_metrics['auroc'] > best_val_auroc:
+                best_val_auroc = val_metrics['auroc']
 
-        # 保存最佳模型
-        if val_metrics['auroc'] > best_val_auroc:
-            best_val_auroc = val_metrics['auroc']
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'val_auroc': val_metrics['auroc'],
+                    'val_auprc': val_metrics['auprc'],
+                    'history': history,
+                }, output_dir / 'best_model.pt')
 
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'val_auroc': val_metrics['auroc'],
-                'val_auprc': val_metrics['auprc'],
-                'history': history,
-            }, output_dir / 'best_model.pt')
+                print(f"✓ 保存最佳模型 (AUROC: {best_val_auroc:.4f})")
 
-            print(f"✓ 保存最佳模型 (AUROC: {best_val_auroc:.4f})")
+            # 定期保存checkpoint
+            if (epoch + 1) % 10 == 0:
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict() if optimizer else None,
+                    'best_val_auroc': best_val_auroc,
+                    'history': history,
+                }, output_dir / f'checkpoint_epoch_{epoch + 1}.pt')
 
-        # 定期保存checkpoint
-        if (epoch + 1) % 10 == 0:
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict() if optimizer else None,
-                'best_val_auroc': best_val_auroc,
-                'history': history,
-            }, output_dir / f'checkpoint_epoch_{epoch + 1}.pt')
-
-            print(f"✓ 保存checkpoint: epoch_{epoch + 1}.pt")
+                print(f"✓ 保存checkpoint: epoch_{epoch + 1}.pt")
 
     # === 6. 最终测试 ===
     print(f"\n{'=' * 80}")
     print("最终测试")
     print(f"{'=' * 80}")
 
-    # 加载最佳模型
-    checkpoint = torch.load(output_dir / 'best_model.pt')
-    model.load_state_dict(checkpoint['model_state_dict'])
+    # 加载最佳模型（Phase 1）
+    if not use_phase2:
+        checkpoint = torch.load(output_dir / 'best_model.pt')
+        model.load_state_dict(checkpoint['model_state_dict'])
 
-    test_metrics = evaluator.evaluate(model, test_loader, graph_wrapper, device)
+    # 位置4: 评估逻辑修改（Phase 2 评估）
+    if use_phase2:
+        from src.training.evaluator import evaluate_phase2
+
+        # Phase 2多维评估
+        test_metrics = evaluate_phase2(
+            model=model,
+            test_dataset=test_dataset,  # ImmuneAppDatasetWithTissue
+            graph_wrapper=graph_wrapper,
+            device=device,
+            stratify_by_tissue=True,
+            output_dir=output_dir
+        )
+    else:
+        # 原有评估逻辑
+        test_metrics = evaluator.evaluate(model, test_loader, graph_wrapper, device)
 
     print(f"\nTest Results:")
     print(f"  Loss: {test_metrics['loss']:.4f}")
@@ -293,11 +389,17 @@ def train_phase1(
         'test_metrics': test_metrics_clean,
         'config': {
             'use_maml': use_maml,
+            'use_phase2': use_phase2,
             'n_epochs': n_epochs,
             'batch_size': batch_size,
             'inner_lr': inner_lr if use_maml else None,
             'meta_lr': meta_lr,
             'inner_steps': inner_steps if use_maml else None,
+            # Phase 2 配置
+            'tissue_source': tissue_source if use_phase2 else None,
+            'phase1_epochs': phase1_epochs if use_phase2 else None,
+            'phase2_epochs': phase2_epochs if use_phase2 else None,
+            'finetune_epochs': finetune_epochs if use_phase2 else None,
         }
     }
 
@@ -308,6 +410,7 @@ def train_phase1(
     print(f"\n✓ 训练完成！结果保存在: {output_dir}")
 
     return model, history
+
 
 def train_standard_epoch(model, dataloader, optimizer, criterion, graph_wrapper, device):
     """
@@ -425,6 +528,17 @@ if __name__ == "__main__":
     parser.add_argument('--inner_lr', type=float, default=0.01)
     parser.add_argument('--resume_from', type=str, default=None)
 
+    # 位置1: 添加argparse参数
+    parser.add_argument('--use_phase2', action='store_true',
+                        help='启用Phase 2 (HLA×Tissue)')
+    parser.add_argument('--tissue_source', default='Inferred_Tissue',
+                        help='组织来源列名')
+    parser.add_argument('--phase1_epochs', type=int, default=50)
+    parser.add_argument('--phase2_epochs', type=int, default=50)
+    parser.add_argument('--finetune_epochs', type=int, default=20)
+    parser.add_argument('--train_path', type=str, default='data/phase2_dataset/train.csv',
+                        help='Phase 2训练数据路径')
+
     args = parser.parse_args()
 
     model, history = train_phase1(
@@ -435,5 +549,12 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         meta_lr=args.meta_lr,
         inner_lr=args.inner_lr,
-        resume_from=args.resume_from
+        resume_from=args.resume_from,
+        # Phase 2 参数传递
+        use_phase2=args.use_phase2,
+        tissue_source=args.tissue_source,
+        phase1_epochs=args.phase1_epochs,
+        phase2_epochs=args.phase2_epochs,
+        finetune_epochs=args.finetune_epochs,
+        train_path=args.train_path
     )

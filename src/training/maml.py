@@ -12,6 +12,7 @@ import torch.optim as optim
 from collections import OrderedDict
 import copy
 from tqdm import tqdm
+import numpy as np
 
 
 class MAMLTrainer:
@@ -370,6 +371,367 @@ class MAMLDataLoader:
     def __len__(self):
         """估算episode数量"""
         return len(self.dataloader) // (self.samples_per_episode // 32)
+
+
+class MAMLTrainerPhase2:
+    """
+    Phase 2 MAML训练器：支持HLA×Tissue任务
+
+    包装你现有的MAMLTrainer，添加Phase 2功能
+
+    Args:
+        base_trainer: 你现有的MAMLTrainer实例
+        tasks: 任务字典 {task_name: {'data': df, 'type': 'phase1'/'phase2', ...}}
+        graph_wrapper: TaskGraphWrapper实例
+        device: torch device
+        max_len: 肽段最大长度（默认15）
+    """
+
+    def __init__(self, base_trainer, tasks, graph_wrapper, device, max_len=15):
+        self.base_trainer = base_trainer
+        self.tasks = tasks
+        self.graph_wrapper = graph_wrapper
+        self.device = device
+        self.max_len = max_len
+
+        # 氨基酸编码字典（与dataset.py保持一致）
+        self.aa_to_idx = {aa: i for i, aa in enumerate('ACDEFGHIKLMNPQRSTVWY')}
+        self.aa_to_idx['X'] = len(self.aa_to_idx)  # padding token = 20
+
+        # 分离Phase 1和Phase 2任务
+        self.phase1_tasks = [name for name, info in tasks.items() if info['type'] == 'phase1']
+        self.phase2_tasks = [name for name, info in tasks.items() if info['type'] == 'phase2']
+
+        # 计算任务权重（平方根平滑）
+        self.task_weights = self._compute_task_weights()
+
+        print(f"\n=== MAMLTrainerPhase2 初始化 ===")
+        print(f"Phase 1 任务: {len(self.phase1_tasks)}")
+        print(f"Phase 2 任务: {len(self.phase2_tasks)}")
+        print(f"总任务数: {len(self.tasks)}")
+
+    def _compute_task_weights(self):
+        """计算任务采样权重（平方根平滑避免大任务主导）"""
+        weights = {}
+        for task_name, task_info in self.tasks.items():
+            n_samples = task_info['n_samples']
+            weights[task_name] = np.sqrt(n_samples)  # 平方根平滑
+
+        # 归一化
+        total = sum(weights.values())
+        weights = {k: v / total for k, v in weights.items()}
+        return weights
+
+    def encode_peptide(self, peptide):
+        """
+        编码肽段序列（与dataset.py完全一致）
+
+        Args:
+            peptide: 肽段序列字符串
+
+        Returns:
+            tensor: (max_len,) 整数编码
+        """
+        # 转为索引
+        indices = [self.aa_to_idx.get(aa, self.aa_to_idx['X']) for aa in peptide]
+
+        # Padding
+        if len(indices) < self.max_len:
+            indices += [self.aa_to_idx['X']] * (self.max_len - len(indices))
+        else:
+            indices = indices[:self.max_len]
+
+        return torch.LongTensor(indices)
+
+    def _prepare_episode(self, task_names, k_shot, q_query):
+        """
+        准备一个episode的数据（support set和query set）
+
+        这是完全适配你代码的版本！
+
+        Args:
+            task_names: 要采样的任务名称列表
+            k_shot: 每个任务的support样本数
+            q_query: 每个任务的query样本数
+
+        Returns:
+            episode_data: {'support': {...}, 'query': {...}}
+        """
+        support_peptides = []
+        support_peptide_lens = []
+        support_task_idxs = []
+        support_labels = []
+
+        query_peptides = []
+        query_peptide_lens = []
+        query_task_idxs = []
+        query_labels = []
+
+        # 为每个任务采样数据
+        for task_idx, task_name in enumerate(task_names):
+            task_data = self.tasks[task_name]['data']
+
+            # 如果数据不足，跳过
+            if len(task_data) < k_shot + q_query:
+                continue
+
+            # 随机采样
+            sampled = task_data.sample(n=k_shot + q_query, replace=False)
+
+            # 分割为support和query
+            support_df = sampled.iloc[:k_shot]
+            query_df = sampled.iloc[k_shot:k_shot + q_query]
+
+            # 处理support set
+            for _, row in support_df.iterrows():
+                peptide_encoded = self.encode_peptide(row['peptide'])
+                peptide_len = len(row['peptide'])
+
+                support_peptides.append(peptide_encoded)
+                support_peptide_lens.append(peptide_len)
+                support_task_idxs.append(task_idx)  # 使用局部任务索引
+                support_labels.append(int(row['label']))
+
+            # 处理query set
+            for _, row in query_df.iterrows():
+                peptide_encoded = self.encode_peptide(row['peptide'])
+                peptide_len = len(row['peptide'])
+
+                query_peptides.append(peptide_encoded)
+                query_peptide_lens.append(peptide_len)
+                query_task_idxs.append(task_idx)
+                query_labels.append(int(row['label']))
+
+        # 转换为tensors并移动到device
+        support_data = {
+            'peptide': torch.stack(support_peptides).to(self.device),
+            'peptide_len': torch.LongTensor(support_peptide_lens).to(self.device),
+            'task_idx': torch.LongTensor(support_task_idxs).to(self.device),
+            'label': torch.LongTensor(support_labels).to(self.device)
+        }
+
+        query_data = {
+            'peptide': torch.stack(query_peptides).to(self.device),
+            'peptide_len': torch.LongTensor(query_peptide_lens).to(self.device),
+            'task_idx': torch.LongTensor(query_task_idxs).to(self.device),
+            'label': torch.LongTensor(query_labels).to(self.device)
+        }
+
+        return {'support': support_data, 'query': query_data}
+
+    def sample_batch_tasks(self, n_way, mode='mixed', phase2_ratio=0.5):
+        """
+        采样一批任务
+
+        Args:
+            n_way: 采样任务数量
+            mode: 'phase1', 'phase2', 'mixed'
+            phase2_ratio: mixed模式下Phase 2任务的比例
+
+        Returns:
+            task_names: 采样的任务名称列表
+        """
+        if mode == 'phase1':
+            # 只采样Phase 1任务
+            available_tasks = self.phase1_tasks
+        elif mode == 'phase2':
+            # 只采样Phase 2任务
+            available_tasks = self.phase2_tasks
+        else:  # mixed
+            # 混合采样
+            n_phase2 = int(n_way * phase2_ratio)
+            n_phase1 = n_way - n_phase2
+
+            # 采样Phase 1任务
+            if n_phase1 > 0 and len(self.phase1_tasks) > 0:
+                weights_p1 = [self.task_weights[t] for t in self.phase1_tasks]
+                weights_p1 = np.array(weights_p1) / sum(weights_p1)
+                phase1_sampled = np.random.choice(
+                    self.phase1_tasks,
+                    size=min(n_phase1, len(self.phase1_tasks)),
+                    replace=False,
+                    p=weights_p1
+                ).tolist()
+            else:
+                phase1_sampled = []
+
+            # 采样Phase 2任务
+            if n_phase2 > 0 and len(self.phase2_tasks) > 0:
+                weights_p2 = [self.task_weights[t] for t in self.phase2_tasks]
+                weights_p2 = np.array(weights_p2) / sum(weights_p2)
+                phase2_sampled = np.random.choice(
+                    self.phase2_tasks,
+                    size=min(n_phase2, len(self.phase2_tasks)),
+                    replace=False,
+                    p=weights_p2
+                ).tolist()
+            else:
+                phase2_sampled = []
+
+            return phase1_sampled + phase2_sampled
+
+        # phase1或phase2模式：加权采样
+        if len(available_tasks) == 0:
+            raise ValueError(f"No tasks available for mode={mode}")
+
+        weights = [self.task_weights[t] for t in available_tasks]
+        weights = np.array(weights) / sum(weights)
+
+        n_sample = min(n_way, len(available_tasks))
+        sampled = np.random.choice(
+            available_tasks,
+            size=n_sample,
+            replace=False,
+            p=weights
+        )
+
+        return sampled.tolist()
+
+    def progressive_train(self, phase1_epochs, phase2_epochs, finetune_epochs,
+                          n_way=5, k_shot=10, q_query=10, episodes_per_epoch=100):
+        """
+        渐进式训练：Phase 1 → Phase 2 → 混合Fine-tuning
+
+        Args:
+            phase1_epochs: Phase 1预训练轮数
+            phase2_epochs: Phase 2引入轮数
+            finetune_epochs: 混合fine-tuning轮数
+            n_way: 每个episode的任务数
+            k_shot: 每个任务的support样本数
+            q_query: 每个任务的query样本数
+            episodes_per_epoch: 每轮的episode数量
+
+        Returns:
+            history: 训练历史记录
+        """
+        history = {
+            'phase1': {'support_loss': [], 'query_loss': []},
+            'phase2': {'support_loss': [], 'query_loss': []},
+            'finetune': {'support_loss': [], 'query_loss': []}
+        }
+
+        # ========== Stage 1: Phase 1预训练 ==========
+        print("\n" + "=" * 60)
+        print("Stage 1: Phase 1预训练（仅HLA任务）")
+        print("=" * 60)
+
+        for epoch in range(phase1_epochs):
+            epoch_support_losses = []
+            epoch_query_losses = []
+
+            pbar = tqdm(range(episodes_per_epoch), desc=f"Phase1 Epoch {epoch + 1}/{phase1_epochs}")
+            for _ in pbar:
+                # 采样Phase 1任务
+                task_names = self.sample_batch_tasks(n_way, mode='phase1')
+
+                # 准备episode数据
+                episode_data = self._prepare_episode(task_names, k_shot, q_query)
+
+                # 获取graph数据
+                graph_data = self._get_graph_data()
+
+                # MAML训练步骤
+                metrics = self.base_trainer.meta_train_step(episode_data, graph_data)
+
+                epoch_support_losses.append(metrics['support_loss'])
+                epoch_query_losses.append(metrics['query_loss'])
+
+                pbar.set_postfix({
+                    'support_loss': f"{np.mean(epoch_support_losses):.4f}",
+                    'query_loss': f"{np.mean(epoch_query_losses):.4f}"
+                })
+
+            history['phase1']['support_loss'].append(np.mean(epoch_support_losses))
+            history['phase1']['query_loss'].append(np.mean(epoch_query_losses))
+
+            print(f"Epoch {epoch + 1}: Support Loss={np.mean(epoch_support_losses):.4f}, "
+                  f"Query Loss={np.mean(epoch_query_losses):.4f}")
+
+        # ========== Stage 2: 渐进引入Phase 2 ==========
+        print("\n" + "=" * 60)
+        print("Stage 2: 渐进引入Phase 2（HLA×Tissue任务）")
+        print("=" * 60)
+
+        for epoch in range(phase2_epochs):
+            # 逐渐增加Phase 2比例：0% → 100%
+            phase2_ratio = (epoch + 1) / phase2_epochs
+
+            epoch_support_losses = []
+            epoch_query_losses = []
+
+            pbar = tqdm(range(episodes_per_epoch),
+                        desc=f"Phase2 Epoch {epoch + 1}/{phase2_epochs} (P2 ratio={phase2_ratio:.2f})")
+            for _ in pbar:
+                # 混合采样
+                task_names = self.sample_batch_tasks(n_way, mode='mixed',
+                                                     phase2_ratio=phase2_ratio)
+
+                episode_data = self._prepare_episode(task_names, k_shot, q_query)
+                graph_data = self._get_graph_data()
+
+                metrics = self.base_trainer.meta_train_step(episode_data, graph_data)
+
+                epoch_support_losses.append(metrics['support_loss'])
+                epoch_query_losses.append(metrics['query_loss'])
+
+                pbar.set_postfix({
+                    'support_loss': f"{np.mean(epoch_support_losses):.4f}",
+                    'query_loss': f"{np.mean(epoch_query_losses):.4f}"
+                })
+
+            history['phase2']['support_loss'].append(np.mean(epoch_support_losses))
+            history['phase2']['query_loss'].append(np.mean(epoch_query_losses))
+
+            print(f"Epoch {epoch + 1}: Support Loss={np.mean(epoch_support_losses):.4f}, "
+                  f"Query Loss={np.mean(epoch_query_losses):.4f}")
+
+        # ========== Stage 3: 混合Fine-tuning ==========
+        print("\n" + "=" * 60)
+        print("Stage 3: 混合Fine-tuning（50-50采样）")
+        print("=" * 60)
+
+        for epoch in range(finetune_epochs):
+            epoch_support_losses = []
+            epoch_query_losses = []
+
+            pbar = tqdm(range(episodes_per_epoch),
+                        desc=f"Finetune Epoch {epoch + 1}/{finetune_epochs}")
+            for _ in pbar:
+                # 50-50混合采样
+                task_names = self.sample_batch_tasks(n_way, mode='mixed',
+                                                     phase2_ratio=0.5)
+
+                episode_data = self._prepare_episode(task_names, k_shot, q_query)
+                graph_data = self._get_graph_data()
+
+                metrics = self.base_trainer.meta_train_step(episode_data, graph_data)
+
+                epoch_support_losses.append(metrics['support_loss'])
+                epoch_query_losses.append(metrics['query_loss'])
+
+                pbar.set_postfix({
+                    'support_loss': f"{np.mean(epoch_support_losses):.4f}",
+                    'query_loss': f"{np.mean(epoch_query_losses):.4f}"
+                })
+
+            history['finetune']['support_loss'].append(np.mean(epoch_support_losses))
+            history['finetune']['query_loss'].append(np.mean(epoch_query_losses))
+
+            print(f"Epoch {epoch + 1}: Support Loss={np.mean(epoch_support_losses):.4f}, "
+                  f"Query Loss={np.mean(epoch_query_losses):.4f}")
+
+        print("\n" + "=" * 60)
+        print("✓ 渐进式训练完成！")
+        print("=" * 60)
+
+        return history
+
+    def _get_graph_data(self):
+        """获取graph数据（与你的代码接口一致）"""
+        return {
+            'edge_index': self.graph_wrapper.edge_index,
+            'edge_weight': self.graph_wrapper.edge_weight
+        }
 
 
 # 测试代码
