@@ -1,7 +1,11 @@
-"""
-PyTorch Dataset 和 DataLoader
 
-用于加载训练/验证/测试数据
+"""
+Mode-Aware Dataset
+
+支持三种模式的PyTorch Dataset:
+- Mode 1 (HLA_ONLY): HLA-specific presentation
+- Mode 2 (HLA_TISSUE): HLA×Tissue-specific presentation
+- Mode 3 (HYBRID): 混合模式 (接口预留)
 """
 
 import torch
@@ -9,48 +13,109 @@ from torch.utils.data import Dataset, DataLoader
 import pandas as pd
 import numpy as np
 from pathlib import Path
+from typing import Dict, Optional, List
 import json
 
+# 导入配置
+import sys
 
-class PeptideHLADataset(Dataset):
+sys.path.append(str(Path(__file__).parent.parent))
+from src.config.mode_config import ModeConfig, TrainingMode
+
+
+class ModeAwareDataset(Dataset):
     """
-    Peptide-HLA 配对数据集
+    Mode-aware Dataset
+
+    根据mode配置自动处理不同的数据格式:
+    - Mode 1: 返回 (peptide, task_idx, label)
+    - Mode 2: 返回 (peptide, task_idx, tissue_idx, label)
 
     Args:
-        csv_file: train.csv / val.csv / test.csv
-        task_mapping_file: task_mapping.json
-        mode: 'train' / 'val' / 'test'
-        max_len: 肽段最大长度（padding到此长度）
+        task_datasets: Dict[task_id, DataFrame] 每个任务的数据
+        task_manager: TaskManager实例
+        mode_config: ModeConfig实例
+        graph_wrapper: TaskGraphWrapper实例 (提供task_to_idx映射)
+        max_len: 肽段最大长度
 
     Example:
-        >>> dataset = PeptideHLADataset('data/phase1_dataset/train.csv',
-        ...                             'data/phase1_dataset/task_mapping.json')
-        >>> sample = dataset[0]
-        >>> print(sample.keys())
+
     """
 
-    def __init__(self, csv_file, task_mapping_file, mode='train', max_len=15):
-        self.df = pd.read_csv(csv_file)
-        self.mode = mode
+    def __init__(self,
+                 task_datasets: Dict[str, pd.DataFrame],
+                 task_manager,
+                 mode_config: ModeConfig,
+                 graph_wrapper,
+                 max_len: int = 15):
+
+        self.mode = mode_config.mode
+        self.mode_config = mode_config
+        self.task_manager = task_manager
+        self.graph_wrapper = graph_wrapper
         self.max_len = max_len
 
-        # 加载 task 映射
-        with open(task_mapping_file) as f:
-            task_mapping = json.load(f)
-
-        self.task_to_idx = task_mapping['task_to_idx']
-        self.tasks = task_mapping['tasks']
-
-        # 氨基酸编码
+        # 氨基酸编码映射
         self.aa_to_idx = {aa: i for i, aa in enumerate('ACDEFGHIKLMNPQRSTVWY')}
         self.aa_to_idx['X'] = len(self.aa_to_idx)  # padding token
 
-        print(f"{mode.upper()} Dataset: {len(self.df):,} samples")
+        # 构建样本列表
+        self.samples = []
+        self._build_samples(task_datasets)
 
-    def __len__(self):
-        return len(self.df)
+        # Mode 2需要构建tissue映射
+        if self.mode == TrainingMode.HLA_TISSUE:
+            self._build_tissue_mappings()
 
-    def encode_peptide(self, peptide):
+        print(f"\n✓ ModeAwareDataset created:")
+        print(f"  Mode: {mode_config.task_type_name}")
+        print(f"  Total samples: {len(self.samples):,}")
+        print(f"  Tasks: {len(task_manager.get_all_tasks())}")
+        if self.mode == TrainingMode.HLA_TISSUE:
+            print(f"  Tissues: {len(self.tissue_to_idx)}")
+
+    def _build_samples(self, task_datasets):
+        """构建样本列表"""
+        for task_id, task_df in task_datasets.items():
+            # 调试: 检查DataFrame的列
+            if len(self.samples) == 0:  # 只在第一个task时打印
+                print(f"\n  Debug: DataFrame columns for first task ({task_id}):")
+                print(f"    {list(task_df.columns)}")
+                if len(task_df) > 0:
+                    print(f"  Sample row:")
+                    print(f"    {dict(task_df.iloc[0])}")
+
+            task = self.task_manager.get_task(task_id)
+            task_idx = self.graph_wrapper.task_to_idx[task_id]
+
+            for idx, row in task_df.iterrows():
+                sample = {
+                    'peptide': row['peptide'],
+                    'hla': row['hla'],
+                    'label': int(row['label']),
+                    'task_id': task_id,
+                    'task_idx': task_idx
+                }
+
+                # Mode 2需要tissue信息
+                if self.mode == TrainingMode.HLA_TISSUE:
+                    if 'tissue' not in row:
+                        print(f"\n  ⚠ WARNING: 'tissue' column missing in task {task_id}")
+                        print(f"    Available columns: {list(task_df.columns)}")
+                        print(f"    Row data: {dict(row)}")
+                        raise KeyError(f"'tissue' column not found in DataFrame for task {task_id}")
+                    sample['tissue'] = row['tissue']
+
+                self.samples.append(sample)
+
+    def _build_tissue_mappings(self):
+        """构建tissue映射 (Mode 2)"""
+        unique_tissues = sorted(set(s['tissue'] for s in self.samples))
+        self.tissue_to_idx = {tissue: idx for idx, tissue in enumerate(unique_tissues)}
+        self.idx_to_tissue = {idx: tissue for tissue, idx in self.tissue_to_idx.items()}
+        self.n_tissues = len(unique_tissues)
+
+    def encode_peptide(self, peptide: str) -> torch.LongTensor:
         """
         编码肽段序列
 
@@ -71,110 +136,134 @@ class PeptideHLADataset(Dataset):
 
         return torch.LongTensor(indices)
 
+    def __len__(self):
+        return len(self.samples)
+
     def __getitem__(self, idx):
         """
         返回一个样本
 
         Returns:
-            dict: {
-                'peptide': tensor (max_len,),
-                'peptide_len': int,
-                'task_idx': int,
-                'label': int (0 or 1)
-            }
+            dict:
+                Mode 1: {'peptide', 'peptide_len', 'task_idx', 'label'}
+                Mode 2: {'peptide', 'peptide_len', 'task_idx', 'tissue_idx', 'label'}
         """
-        row = self.df.iloc[idx]
+        sample = self.samples[idx]
 
-        peptide = row['Peptide']
-        peptide_len = int(row['Peptide_Length'])
-        hla = row['MHC_Restriction_Name']
-        label = int(row['Label'])
+        # 编码peptide
+        peptide_encoded = self.encode_peptide(sample['peptide'])
+        peptide_len = min(len(sample['peptide']), self.max_len)
 
-        # 编码肽段
-        peptide_encoded = self.encode_peptide(peptide)
-
-        # 获取 task 索引
-        task_idx = self.task_to_idx.get(hla, -1)
-
-        # 如果 task 不在映射中，跳过（返回默认值）
-        if task_idx == -1:
-            # 使用第一个 task 作为默认
-            task_idx = 0
-
-        return {
+        # 基础返回值 (Mode 1和Mode 2共享)
+        result = {
             'peptide': peptide_encoded,
             'peptide_len': torch.LongTensor([peptide_len]),
-            'task_idx': torch.LongTensor([task_idx]),
-            'label': torch.LongTensor([label]),
+            'task_idx': torch.LongTensor([sample['task_idx']]),
+            'label': torch.FloatTensor([sample['label']])
         }
 
+        # Mode 2额外返回tissue_idx
+        if self.mode == TrainingMode.HLA_TISSUE:
+            tissue_idx = self.tissue_to_idx[sample['tissue']]
+            result['tissue_idx'] = torch.LongTensor([tissue_idx])
 
-def collate_fn(batch):
-    """
-    自定义 collate 函数
+        return result
 
-    将 list of dicts 转换为 dict of tensors
+
+def collate_fn_mode_aware(batch):
     """
+    自定义collate函数,支持Mode 1和Mode 2
+
+    Args:
+        batch: List of samples from ModeAwareDataset
+
+    Returns:
+        dict: Batched tensors
+    """
+    # 提取所有字段
     peptides = torch.stack([item['peptide'] for item in batch])
-    peptide_lens = torch.cat([item['peptide_len'] for item in batch])
-    task_idxs = torch.cat([item['task_idx'] for item in batch])
-    labels = torch.cat([item['label'] for item in batch])
 
-    return {
+    # 标量tensor使用stack (不是cat)
+    peptide_lens = torch.stack([item['peptide_len'] for item in batch])
+    task_idxs = torch.stack([item['task_idx'] for item in batch])
+    labels = torch.stack([item['label'] for item in batch])
+
+    # === 确保是1D tensor ===
+    # pack_padded_sequence要求lengths是1D
+    if peptide_lens.dim() > 1:
+        peptide_lens = peptide_lens.squeeze()
+    if task_idxs.dim() > 1:
+        task_idxs = task_idxs.squeeze()
+    if labels.dim() > 1:
+        labels = labels.squeeze()
+
+    result = {
         'peptide': peptides,
         'peptide_len': peptide_lens,
         'task_idx': task_idxs,
-        'label': labels,
+        'label': labels
     }
 
+    # Mode 2包含tissue_idx
+    if 'tissue_idx' in batch[0]:
+        tissue_idxs = torch.stack([item['tissue_idx'] for item in batch])
+        if tissue_idxs.dim() > 1:
+            tissue_idxs = tissue_idxs.squeeze()
+        result['tissue_idx'] = tissue_idxs
 
-def create_dataloaders(
-        dataset_dir='data/phase1_dataset',
-        batch_size=32,
-        num_workers=4,
-        meta_learning=False
+    return result
+
+
+def create_mode_aware_dataloaders(
+        train_datasets: Dict[str, pd.DataFrame],
+        val_datasets: Dict[str, pd.DataFrame],
+        test_datasets: Dict[str, pd.DataFrame],
+        task_manager,
+        mode_config: ModeConfig,
+        graph_wrapper,
+        batch_size: int = 32,
+        num_workers: int = 4,
+        max_len: int = 15
 ):
     """
-    创建数据加载器
+    创建Mode-aware DataLoaders
 
     Args:
-        dataset_dir: 数据集目录
-        batch_size: batch 大小
-        num_workers: 数据加载的进程数
-        meta_learning: 是否用于 meta-learning（目前未使用）
+        train/val/test_datasets: 各个任务的数据集
+        task_manager: TaskManager实例
+        mode_config: ModeConfig实例
+        graph_wrapper: TaskGraphWrapper实例
+        batch_size: batch大小
+        num_workers: 数据加载进程数
+        max_len: 肽段最大长度
 
     Returns:
         train_loader, val_loader, test_loader
     """
-    dataset_dir = Path(dataset_dir)
-    task_mapping_file = dataset_dir / 'task_mapping.json'
+    print(f"\n{'=' * 80}")
+    print(f"Creating Mode-Aware DataLoaders")
+    print(f"{'=' * 80}")
 
-    # 创建 datasets
-    train_dataset = PeptideHLADataset(
-        dataset_dir / 'train.csv',
-        task_mapping_file,
-        mode='train'
+    # 创建datasets
+    train_dataset = ModeAwareDataset(
+        train_datasets, task_manager, mode_config, graph_wrapper, max_len
     )
 
-    val_dataset = PeptideHLADataset(
-        dataset_dir / 'val.csv',
-        task_mapping_file,
-        mode='val'
+    val_dataset = ModeAwareDataset(
+        val_datasets, task_manager, mode_config, graph_wrapper, max_len
     )
 
-    test_dataset = PeptideHLADataset(
-        dataset_dir / 'test.csv',
-        task_mapping_file,
-        mode='test'
+    test_dataset = ModeAwareDataset(
+        test_datasets, task_manager, mode_config, graph_wrapper, max_len
     )
 
-    # 创建 dataloaders
+    # 创建dataloaders
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        collate_fn=collate_fn,
+        collate_fn=collate_fn_mode_aware,
         pin_memory=True
     )
 
@@ -183,7 +272,7 @@ def create_dataloaders(
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        collate_fn=collate_fn,
+        collate_fn=collate_fn_mode_aware,
         pin_memory=True
     )
 
@@ -192,112 +281,142 @@ def create_dataloaders(
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        collate_fn=collate_fn,
+        collate_fn=collate_fn_mode_aware,
         pin_memory=True
     )
+
+    print(f"\n✓ DataLoaders created:")
+    print(f"  Train: {len(train_dataset):,} samples, {len(train_loader)} batches")
+    print(f"  Val: {len(val_dataset):,} samples, {len(val_loader)} batches")
+    print(f"  Test: {len(test_dataset):,} samples, {len(test_loader)} batches")
 
     return train_loader, val_loader, test_loader
 
 
-# ===== 新增：支持组织信息的Dataset =====
-class ImmuneAppDatasetWithTissue(Dataset):
-    """
-    Phase 2: 支持组织信息的数据集
-    兼容你的TSV格式数据
-    """
+# 向后兼容: 保留旧的PeptideHLADataset类名
+# 但功能已被ModeAwareDataset替代
+PeptideHLADataset = ModeAwareDataset
+create_dataloaders = create_mode_aware_dataloaders
 
-    def __init__(self, data_path, tissue_source='Inferred_Tissue',
-                 normalize_tissue=True, filter_unknown=False):
-        print(f"\n加载数据: {data_path}")
-        self.data = pd.read_csv(data_path, sep='\t')
-
-        # 重命名列以匹配内部使用
-        self.data = self.data.rename(columns={
-            'MHC_Restriction_Name': 'hla',
-            'Peptide': 'peptide',
-            tissue_source: 'tissue',
-            'Label': 'label'
-        })
-
-        # 处理组织信息
-        self.data['tissue'] = self.data['tissue'].fillna('Unknown')
-
-        if normalize_tissue:
-            self.data['tissue'] = self.data['tissue'].apply(
-                self._normalize_tissue_name
-            )
-
-        if filter_unknown:
-            before = len(self.data)
-            self.data = self.data[self.data['tissue'] != 'Unknown']
-            print(f"  过滤Unknown: {before} -> {len(self.data)}")
-
-        self._print_statistics()
-
-    def _normalize_tissue_name(self, tissue):
-        """标准化组织名称"""
-        if pd.isna(tissue) or str(tissue).strip() == '':
-            return 'Unknown'
-
-        tissue = str(tissue).strip().lower()
-
-        tissue_mapping = {
-            'lymphoid': 'Lymphoid',
-            'blood': 'Blood',
-            'pbmc': 'Blood',
-            'lung': 'Lung',
-            'liver': 'Liver',
-            'brain': 'Brain',
-            'skin': 'Skin',
-            'breast': 'Breast',
-            'colon': 'Colon',
-            'kidney': 'Kidney',
-            'pancreas': 'Pancreas',
-            'stomach': 'Stomach',
-        }
-
-        for key, value in tissue_mapping.items():
-            if key in tissue:
-                return value
-
-        return tissue.capitalize()
-
-    def _print_statistics(self):
-        """打印统计信息"""
-        print(f"\n数据集统计:")
-        print(f"  总样本: {len(self.data)}")
-        print(f"  正样本: {(self.data['label'] == 1).sum()}")
-        print(f"  HLA类型: {self.data['hla'].nunique()}")
-        print(f"  组织类型: {self.data['tissue'].nunique()}")
-
-        print(f"\n  各组织样本数:")
-        for tissue, count in self.data['tissue'].value_counts().items():
-            pos = ((self.data['tissue'] == tissue) &
-                   (self.data['label'] == 1)).sum()
-            print(f"    {tissue:15s}: {count:5d} (正:{pos:4d})")
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        row = self.data.iloc[idx]
-        return {
-            'peptide': row['peptide'],
-            'hla': row['hla'],
-            'tissue': row['tissue'],
-            'label': row['label']
-        }
-
-    def get_dataframe(self):
-        """返回DataFrame用于任务创建"""
-        return self.data[['peptide', 'hla', 'tissue', 'label']].copy()
-
-
-# 测试代码
 if __name__ == "__main__":
-    print("Testing PeptideHLADataset...")
+    print("=" * 80)
+    print("Testing ModeAwareDataset")
+    print("=" * 80)
 
-    # 需要实际的数据文件来测试
-    # 这里只打印提示
-    print("✓ Dataset module loaded successfully!")
-    print("  Use with actual data files for full testing")
+    # 创建模拟数据
+    from src.config.mode_config import create_mode1_config, create_mode2_config
+    from src.data.task_definition import Task, TaskManager
+    import pandas as pd
+    import numpy as np
+
+    np.random.seed(42)
+
+    # Mode 1测试
+    print("\n" + "=" * 80)
+    print("Testing Mode 1 (HLA_ONLY)")
+    print("=" * 80)
+
+    config1 = create_mode1_config()
+
+    # 创建模拟task_manager
+    manager1 = TaskManager(mode='hla_only')
+    task1 = Task.create_mode1_task(
+        hla='HLA-A*02:01',
+        data=pd.DataFrame({'label': [1] * 10})
+    )
+    manager1.add_task(task1)
+
+    # 创建模拟task_datasets
+    task_datasets1 = {
+        task1.task_id: pd.DataFrame({
+            'peptide': ['TESTPEP' + str(i) for i in range(20)],
+            'hla': ['HLA-A*02:01'] * 20,
+            'label': [1] * 10 + [0] * 10
+        })
+    }
+
+
+    # 创建模拟graph_wrapper
+    class MockGraphWrapper:
+        def __init__(self):
+            self.task_to_idx = {task1.task_id: 0}
+            self.n_tasks = 1
+
+
+    graph_wrapper1 = MockGraphWrapper()
+
+    # 创建dataset
+    dataset1 = ModeAwareDataset(
+        task_datasets1,
+        manager1,
+        config1,
+        graph_wrapper1
+    )
+
+    # 测试__getitem__
+    sample1 = dataset1[0]
+    print(f"\n✓ Mode 1 Sample:")
+    for key, value in sample1.items():
+        print(f"  {key}: {value.shape if isinstance(value, torch.Tensor) else value}")
+
+    # Mode 2测试
+    print("\n" + "=" * 80)
+    print("Testing Mode 2 (HLA_TISSUE)")
+    print("=" * 80)
+
+    config2 = create_mode2_config()
+
+    manager2 = TaskManager(mode='hla_tissue')
+    task2 = Task.create_mode2_task(
+        hla='HLA-A*02:01',
+        tissue='Liver',
+        data=pd.DataFrame({'label': [1] * 10})
+    )
+    manager2.add_task(task2)
+
+    task_datasets2 = {
+        task2.task_id: pd.DataFrame({
+            'peptide': ['TESTPEP' + str(i) for i in range(20)],
+            'hla': ['HLA-A*02:01'] * 20,
+            'tissue': ['Liver'] * 20,
+            'label': [1] * 10 + [0] * 10
+        })
+    }
+
+
+    class MockGraphWrapper2:
+        def __init__(self):
+            self.task_to_idx = {task2.task_id: 0}
+            self.n_tasks = 1
+
+
+    graph_wrapper2 = MockGraphWrapper2()
+
+    dataset2 = ModeAwareDataset(
+        task_datasets2,
+        manager2,
+        config2,
+        graph_wrapper2
+    )
+
+    sample2 = dataset2[0]
+    print(f"\n✓ Mode 2 Sample:")
+    for key, value in sample2.items():
+        print(f"  {key}: {value.shape if isinstance(value, torch.Tensor) else value}")
+
+    # 测试collate_fn
+    print("\n" + "=" * 80)
+    print("Testing collate_fn")
+    print("=" * 80)
+
+    batch1 = collate_fn_mode_aware([dataset1[i] for i in range(4)])
+    print(f"\n✓ Mode 1 Batch:")
+    for key, value in batch1.items():
+        print(f"  {key}: {value.shape}")
+
+    batch2 = collate_fn_mode_aware([dataset2[i] for i in range(4)])
+    print(f"\n✓ Mode 2 Batch:")
+    for key, value in batch2.items():
+        print(f"  {key}: {value.shape}")
+
+    print("\n✓ All tests passed!")

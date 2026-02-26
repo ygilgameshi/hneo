@@ -8,14 +8,13 @@
 """
 
 from .maml import MAMLTrainer, MAMLDataLoader
-from .trainer import train_phase1, train_standard_epoch, train_maml_epoch
+from .unified_trainer import train_model
 from .evaluator import Evaluator
 
 __all__ = [
     'MAMLTrainer',
     'MAMLDataLoader',
-    'train_phase1',
-    'train_standard_epoch',
-    'train_maml_epoch',
+    'train_model',
+
     'Evaluator',
 ]

@@ -5,8 +5,14 @@
 """
 
 from .dataset import PeptideHLADataset, create_dataloaders
+from .enhanced_negative_sampler import EnhancedNegativeSampler
+from .negative_cache import NegativeSampleCache
 
 __all__ = [
     'PeptideHLADataset',
     'create_dataloaders',
+    'EnhancedNegativeSampler',
+    'NegativeSampleCache'
+
+
 ]
