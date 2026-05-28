@@ -45,7 +45,7 @@ HistoNeo w/ Tissue 以**图神经网络（GNN）**为骨干，配合**FiLM（Fea
 ## 模型架构
 
 <p align="center">
-  <img src="assets/architecture.svg" alt="HistoNeo Architecture" width="900"/>
+  <img src="architecture.svg" alt="HistoNeo Architecture" width="900"/>
 </p>
 
 三阶段流水线（肽段编码器 → 任务 GNN → 预测器）在两种配置间共享。w/ Tissue 额外引入轻量级的组织 FiLM 分支，参数量增加约 5–10%。
