@@ -1,0 +1,165 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 520" font-family="'Segoe UI', Calibri, Arial, sans-serif">
+  <defs>
+    <filter id="shadow" x="-3%" y="-3%" width="106%" height="110%">
+      <feDropShadow dx="1" dy="2" stdDeviation="3" flood-opacity="0.08"/>
+    </filter>
+    <marker id="arrowBlue" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#1565C0"/>
+    </marker>
+    <marker id="arrowTeal" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#00897B"/>
+    </marker>
+    <marker id="arrowOrange" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#EF6C00"/>
+    </marker>
+    <marker id="arrowDark" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#37474F"/>
+    </marker>
+    <linearGradient id="filmGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#FFF8E1"/>
+      <stop offset="100%" style="stop-color:#FFF3E0"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1000" height="520" fill="#FAFBFC" rx="8"/>
+
+  <!-- Title -->
+  <text x="500" y="32" text-anchor="middle" font-size="16" font-weight="700" fill="#0D47A1" letter-spacing="1">HISTONEO ARCHITECTURE</text>
+  <line x1="400" y1="40" x2="600" y2="40" stroke="#00897B" stroke-width="2"/>
+
+  <!-- ==================== INPUT BOXES ==================== -->
+  <!-- Peptide Input -->
+  <rect x="30" y="80" width="130" height="55" rx="8" fill="#E3F2FD" stroke="#1565C0" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="95" y="103" text-anchor="middle" font-size="13" font-weight="600" fill="#1565C0">Peptide</text>
+  <text x="95" y="120" text-anchor="middle" font-size="10" fill="#5C6BC0">8–15 amino acids</text>
+
+  <!-- HLA Input -->
+  <rect x="30" y="195" width="130" height="55" rx="8" fill="#E0F2F1" stroke="#00897B" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="95" y="218" text-anchor="middle" font-size="13" font-weight="600" fill="#00897B">HLA Allele</text>
+  <text x="95" y="235" text-anchor="middle" font-size="10" fill="#009688">34-res pseudo-seq</text>
+
+  <!-- Tissue Input -->
+  <rect x="30" y="310" width="130" height="55" rx="8" fill="#FFF3E0" stroke="#EF6C00" stroke-width="1.5" filter="url(#shadow)"/>
+  <text x="95" y="333" text-anchor="middle" font-size="13" font-weight="600" fill="#EF6C00">Tissue Label</text>
+  <text x="95" y="350" text-anchor="middle" font-size="10" fill="#F57C00">40 categories</text>
+
+  <!-- ==================== ARROWS FROM INPUT ==================== -->
+  <line x1="160" y1="107" x2="210" y2="107" stroke="#1565C0" stroke-width="2" marker-end="url(#arrowBlue)"/>
+  <line x1="160" y1="222" x2="210" y2="222" stroke="#00897B" stroke-width="2" marker-end="url(#arrowTeal)"/>
+  <line x1="160" y1="337" x2="210" y2="337" stroke="#EF6C00" stroke-width="2" marker-end="url(#arrowOrange)"/>
+
+  <!-- ==================== PROCESSING BLOCKS ==================== -->
+  <!-- Peptide Encoder -->
+  <rect x="218" y="65" width="185" height="85" rx="8" fill="white" stroke="#E0E0E0" stroke-width="1" filter="url(#shadow)"/>
+  <rect x="218" y="65" width="5" height="85" rx="3 0 0 3" fill="#1565C0"/>
+  <text x="235" y="88" font-size="13" font-weight="600" fill="#1565C0">Peptide Encoder</text>
+  <text x="235" y="107" font-size="10" fill="#78909C">Embed (128d)</text>
+  <text x="235" y="121" font-size="10" fill="#78909C">→ 2× Conv1D (k=3)</text>
+  <text x="235" y="135" font-size="10" fill="#78909C">→ 2× BiLSTM (64d)</text>
+
+  <!-- Task Graph GNN -->
+  <rect x="218" y="180" width="185" height="85" rx="8" fill="white" stroke="#E0E0E0" stroke-width="1" filter="url(#shadow)"/>
+  <rect x="218" y="180" width="5" height="85" rx="3 0 0 3" fill="#00897B"/>
+  <text x="235" y="203" font-size="13" font-weight="600" fill="#00897B">Task Graph GNN</text>
+  <text x="235" y="222" font-size="10" fill="#78909C">3-layer GCN (64d)</text>
+  <text x="235" y="236" font-size="10" fill="#78909C">Identity-weighted edges</text>
+  <text x="235" y="250" font-size="10" fill="#78909C">Threshold &lt; 0.3 pruned</text>
+
+  <!-- Tissue Embedding -->
+  <rect x="218" y="298" width="185" height="65" rx="8" fill="white" stroke="#E0E0E0" stroke-width="1" filter="url(#shadow)"/>
+  <rect x="218" y="298" width="5" height="65" rx="3 0 0 3" fill="#EF6C00"/>
+  <text x="235" y="323" font-size="13" font-weight="600" fill="#EF6C00">Tissue Embedding</text>
+  <text x="235" y="342" font-size="10" fill="#78909C">40 → 32-dim learnable</text>
+
+  <!-- ==================== ARROWS TO FiLM ==================== -->
+  <line x1="403" y1="107" x2="460" y2="200" stroke="#1565C0" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#arrowBlue)"/>
+  <line x1="403" y1="222" x2="460" y2="222" stroke="#00897B" stroke-width="2" marker-end="url(#arrowTeal)"/>
+  <line x1="403" y1="330" x2="460" y2="248" stroke="#EF6C00" stroke-width="2" marker-end="url(#arrowOrange)"/>
+
+  <!-- Dashed label: "bypasses FiLM" -->
+  <text x="418" y="138" font-size="8" fill="#90A4AE" transform="rotate(-25, 418, 138)">direct to concat</text>
+
+  <!-- ==================== FiLM BLOCK ==================== -->
+  <rect x="468" y="155" width="160" height="145" rx="10" fill="url(#filmGrad)" stroke="#F9A825" stroke-width="1.5" filter="url(#shadow)"/>
+  <rect x="468" y="155" width="160" height="4" rx="2" fill="#F9A825"/>
+  <text x="548" y="182" text-anchor="middle" font-size="15" font-weight="700" fill="#EF6C00">FiLM</text>
+  <text x="548" y="200" text-anchor="middle" font-size="11" fill="#795548">Feature-wise Linear</text>
+  <text x="548" y="214" text-anchor="middle" font-size="11" fill="#795548">Modulation</text>
+  <!-- FiLM formula -->
+  <rect x="482" y="225" width="132" height="28" rx="5" fill="white" stroke="#FFCC80" stroke-width="1"/>
+  <text x="548" y="244" text-anchor="middle" font-size="13" font-weight="600" fill="#E65100" font-family="'Consolas', 'Courier New', monospace">γ ⊙ h + β</text>
+  <!-- FiLM description -->
+  <text x="548" y="275" text-anchor="middle" font-size="9" fill="#8D6E63">tissue conditions</text>
+  <text x="548" y="287" text-anchor="middle" font-size="9" fill="#8D6E63">task representation</text>
+
+  <!-- ==================== ARROW TO CONCAT ==================== -->
+  <line x1="628" y1="222" x2="685" y2="222" stroke="#37474F" stroke-width="2" marker-end="url(#arrowDark)"/>
+
+  <!-- ==================== CONCAT + MLP ==================== -->
+  <!-- Concat -->
+  <rect x="693" y="120" width="115" height="70" rx="8" fill="white" stroke="#E0E0E0" stroke-width="1" filter="url(#shadow)"/>
+  <rect x="693" y="120" width="5" height="70" rx="3 0 0 3" fill="#37474F"/>
+  <text x="710" y="148" font-size="12" font-weight="600" fill="#37474F">Concatenate</text>
+  <text x="710" y="166" font-size="10" fill="#78909C" font-family="'Consolas', monospace">pep ⊕ task</text>
+
+  <!-- Vertical arrow -->
+  <line x1="750" y1="190" x2="750" y2="218" stroke="#37474F" stroke-width="2" marker-end="url(#arrowDark)"/>
+
+  <!-- MLP -->
+  <rect x="693" y="225" width="115" height="75" rx="8" fill="white" stroke="#E0E0E0" stroke-width="1" filter="url(#shadow)"/>
+  <rect x="693" y="225" width="5" height="75" rx="3 0 0 3" fill="#37474F"/>
+  <text x="710" y="250" font-size="12" font-weight="600" fill="#37474F">MLP Head</text>
+  <text x="710" y="268" font-size="10" fill="#78909C" font-family="'Consolas', monospace">128 → 64 → 1</text>
+  <text x="710" y="284" font-size="10" fill="#78909C" font-family="'Consolas', monospace">ReLU + Dropout</text>
+
+  <!-- Peptide bypass to concat -->
+  <line x1="430" y1="80" x2="690" y2="140" stroke="#1565C0" stroke-width="1.5" stroke-dasharray="6,3" marker-end="url(#arrowBlue)"/>
+
+  <!-- ==================== ARROW TO OUTPUT ==================== -->
+  <line x1="808" y1="262" x2="860" y2="262" stroke="#37474F" stroke-width="2" marker-end="url(#arrowDark)"/>
+
+  <!-- ==================== OUTPUT ==================== -->
+  <circle cx="910" cy="262" r="42" fill="#2E7D32" filter="url(#shadow)"/>
+  <text x="910" y="255" text-anchor="middle" font-size="13" font-weight="700" fill="white">P(pres)</text>
+  <text x="910" y="273" text-anchor="middle" font-size="11" fill="#A5D6A7">[0, 1]</text>
+
+  <!-- ==================== BOTTOM: MODE COMPARISON ==================== -->
+  <line x1="30" y1="400" x2="970" y2="400" stroke="#E0E0E0" stroke-width="1"/>
+
+  <!-- w/o Tissue -->
+  <rect x="30" y="420" width="455" height="55" rx="8" fill="#E3F2FD" filter="url(#shadow)"/>
+  <text x="50" y="448" font-size="14" font-weight="700" fill="#1565C0">HistoNeo w/o Tissue</text>
+  <text x="260" y="448" font-size="12" fill="#455A64">P(presentation | peptide, HLA)</text>
+  <text x="50" y="465" font-size="10" fill="#78909C">142 HLA tasks (human)  •  Tissue branch disabled  •  Ablation baseline</text>
+
+  <!-- w/ Tissue -->
+  <rect x="515" y="420" width="455" height="55" rx="8" fill="#E8F5E9" filter="url(#shadow)"/>
+  <text x="535" y="448" font-size="14" font-weight="700" fill="#2E7D32">HistoNeo w/ Tissue</text>
+  <text x="735" y="448" font-size="12" fill="#455A64">P(presentation | peptide, HLA, tissue)</text>
+  <text x="535" y="465" font-size="10" fill="#78909C">1,037 HLA×Tissue tasks (human)  •  FiLM conditioning active  •  Full model</text>
+
+  <!-- ==================== GNN MINI GRAPH (decorative) ==================== -->
+  <g transform="translate(218, 390)" opacity="0.35">
+    <line x1="0" y1="35" x2="40" y2="15" stroke="#B2DFDB" stroke-width="2"/>
+    <line x1="40" y1="15" x2="80" y2="35" stroke="#B2DFDB" stroke-width="2"/>
+    <line x1="0" y1="35" x2="80" y2="35" stroke="#B2DFDB" stroke-width="1.5"/>
+    <line x1="40" y1="15" x2="40" y2="55" stroke="#B2DFDB" stroke-width="1.5"/>
+    <line x1="0" y1="35" x2="40" y2="55" stroke="#B2DFDB" stroke-width="1"/>
+    <line x1="80" y1="35" x2="40" y2="55" stroke="#B2DFDB" stroke-width="1"/>
+    <circle cx="0" cy="35" r="6" fill="#1565C0"/>
+    <circle cx="40" cy="15" r="5" fill="#00897B"/>
+    <circle cx="80" cy="35" r="7" fill="#EF6C00"/>
+    <circle cx="40" cy="55" r="4" fill="#78909C"/>
+  </g>
+
+  <!-- ==================== LEGEND ==================== -->
+  <g transform="translate(30, 498)">
+    <rect width="8" height="8" rx="1" fill="#1565C0"/><text x="14" y="8" font-size="9" fill="#78909C">Peptide path</text>
+    <rect x="110" width="8" height="8" rx="1" fill="#00897B"/><text x="124" y="8" font-size="9" fill="#78909C">HLA/GNN path</text>
+    <rect x="230" width="8" height="8" rx="1" fill="#EF6C00"/><text x="244" y="8" font-size="9" fill="#78909C">Tissue path</text>
+    <rect x="340" width="8" height="8" rx="1" fill="#37474F"/><text x="354" y="8" font-size="9" fill="#78909C">Prediction path</text>
+    <line x1="450" y1="4" x2="475" y2="4" stroke="#90A4AE" stroke-width="1.5" stroke-dasharray="4,2"/>
+    <text x="480" y="8" font-size="9" fill="#78909C">Direct connection (bypasses FiLM)</text>
+  </g>
+</svg>
