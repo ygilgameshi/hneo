@@ -8,80 +8,99 @@
 
 ## 项目简介
 
-HistoNeo（HNeo）是西交利物浦大学（XJTLU）博士研究课题的配套代码库，核心问题是：在 HLA 等位基因信息之外，额外引入**组织上下文**是否能有效提升 MHC-I 肽段呈递预测的准确性——这是个性化癌症疫苗设计中的关键瓶颈。
+HistoNeo 是西交利物浦大学（XJTLU）博士研究课题的配套代码库，核心问题是：在 HLA 等位基因信息之外，额外引入**组织上下文**是否能有效提升 MHC-I 肽段呈递预测的准确性——这是个性化癌症疫苗设计中的关键瓶颈。
 
-核心假设是：抗原呈递不仅由 HLA 等位基因决定，也受到组织微环境的影响。HistoNeo 通过以下两种模式的对照实验加以验证：
+核心假设是：抗原呈递不仅由 HLA 等位基因决定，也受到组织微环境的影响（蛋白酶体组成、TAP 表达、组织特异性分子伴侣等因素因组织而异）。HistoNeo 通过以下两种配置的对照实验加以验证：
 
-| 模式 | 任务定义 | 描述 |
+| 配置 | 任务定义 | 描述 |
 |------|---------|------|
-| **Mode 1** | 仅 HLA | 基线：仅基于 HLA 等位基因进行呈递预测 |
-| **Mode 2** | HLA × Tissue | 提出方法：同时基于 HLA 等位基因和组织类型进行预测 |
+| **HistoNeo w/o Tissue** | 仅 HLA | 消融基线：仅基于 HLA 等位基因进行呈递预测（142 个任务） |
+| **HistoNeo w/ Tissue** | HLA × Tissue | 完整模型：同时基于 HLA 等位基因和组织类型进行预测（1,037 个任务） |
 
-Mode 2 以**图神经网络（GNN）**为骨干，配合**FiLM（Feature-wise Linear Modulation）**层，使组织嵌入向量能够动态调制 HLA 特异性的任务表示。
+HistoNeo w/ Tissue 以**图神经网络（GNN）**为骨干，配合**FiLM（Feature-wise Linear Modulation）**层，使组织嵌入向量能够动态调制 HLA 特异性的任务表示。
 
 ---
 
 ## 主要结果
 
-在 IEDB 免疫肽组学留出测试集上，Mode 2（HLA × Tissue）相比 Mode 1 基线：
+在 IEDB 免疫肽组学留出测试集上（人类，142 个 HLA-I 等位基因，40 个组织类别）：
 
-- **AUROC**：提升 +4.9%
-- **AUPRC**：提升 +16.5%
+| 模型 | AUROC | σ(AUROC) | F1 | AUPRC |
+|:-----|:-----:|:--------:|:--:|:-----:|
+| **HistoNeo w/ Tissue** | **0.9874** | **0.0220** | 0.8084† | — |
+| MHCflurry 2.0 | 0.9785 | 0.0459 | 0.8264 | — |
+| HistoNeo w/o Tissue | 0.9778 | 0.0347 | 0.7449 | — |
+| MixMHCpred 3.0 | 0.9677 | 0.0520 | 0.7598 | — |
+| NetMHCpan 4.2c | 0.9645 | 0.0477 | 0.7629 | 0.8968 |
 
-一个值得关注的反直觉发现是：Mode 2 在**训练样本稀少的罕见任务**上增益更为显著，说明组织条件化在数据匮乏时能提供有效的归纳偏置。
+> † w/ Tissue 的 F1 在 1,037 个 HLA×Tissue 任务上评估；其他 F1 在 142 个 HLA-only 任务上评估。AUROC 和 σ(AUROC) 为主要对比指标。
+
+**核心发现**：
+- HistoNeo w/ Tissue 相比 w/o Tissue，F1 提升 **+8.52%**，AUROC 方差降低 **36.6%**
+- 在**训练样本稀少的罕见任务**上增益更为显著，说明组织条件化在数据匮乏时能提供有效的归纳偏置
+- 小鼠跨物种验证（18 个 MHC 等位基因，26 个组织）同样观察到 **+7.9% AUROC 增益**，证实组织信号的生物学普遍性
 
 ---
 
 ## 模型架构
 
-```
-输入：(肽段序列, HLA 等位基因, 组织标签)
+<p align="center">
+  <img src="assets/architecture.svg" alt="HistoNeo Architecture" width="900"/>
+</p>
 
-肽段编码器 (Peptide Encoder)
-  └── 氨基酸嵌入 + BiLSTM/Conv → 肽段特征
+三阶段流水线（肽段编码器 → 任务 GNN → 预测器）在两种配置间共享。w/ Tissue 额外引入轻量级的组织 FiLM 分支，参数量增加约 5–10%。
 
-任务图神经网络 (Task GNN)
-  └── 每个 HLA 等位基因作为图节点
-  └── 边权重由 HLA 伪序列相似度（BLOSUM50）计算
-  └── 消息传递 → HLA 任务嵌入
+### 组件说明
 
-[仅 Mode 2] 组织 FiLM 层
-  └── 组织嵌入（可学习查找表）
-  └── FiLM: task_emb = γ(tissue) * task_emb + β(tissue)
+| 组件 | 结构 | 说明 |
+|:-----|:-----|:-----|
+| **Peptide Encoder** | Embed (128d) → 2×Conv1D (k=3) → 2×BiLSTM (64d) → Linear | 提取肽段序列的局部 motif 与全局上下文特征 |
+| **Task Graph GNN** | 3-layer GCN, 64-dim per layer, dropout=0.3 | 在伪序列相似度图上传播任务表示，实现数据稀缺任务的知识迁移 |
+| **Tissue Embedding** | 40 类 → 32-dim learnable lookup | 将组织类别映射为稠密向量 |
+| **FiLM** | γ = Linear(tissue), β = Linear(tissue); output = γ ⊙ h + β | 通过逐元素缩放与偏移，使任务表示适应组织上下文 |
+| **Prediction Head** | MLP (128→64→1), ReLU + Dropout + Sigmoid | 输入 [peptide_repr ⊕ task_repr]，输出呈递概率 |
 
-任务条件化预测器 (Task-Conditioned Predictor)
-  └── MLP([肽段特征; 任务嵌入]) → 呈递得分
-```
+---
 
-三阶段流水线（肽段编码器 → 任务 GNN → 预测器）在两种模式间共享。Mode 2 额外引入轻量级的组织 FiLM 分支，参数量增加约 5–10%。
+## 数据集
+
+| 物种 | 等位基因 | 组织 | 独立肽段 | 肽段–等位基因对 | 正样本数 |
+|:-----|:-------:|:---:|:-------:|:-------------:|:-------:|
+| 人类 | 142 | 40 | 342,934 | 545,391 | 851,365 |
+| 小鼠 | 18 | 26 | 48,450 | 69,294 | 109,804 |
+
+- **数据来源**：IEDB 质谱免疫肽组学数据
+- **肽段长度**：8–15 残基（人类数据中 9-mer 占 60.8%）
+- **数据划分**：80 / 10 / 10（训练 / 验证 / 测试），按 HLA×Tissue 组合分层
+- **负样本比例**：10:1（阴性:阳性），基于来源蛋白配对切割动态生成
 
 ---
 
 ## 仓库结构
 
 ```
-HNeo/
+HistoNeo/
 ├── configs/
 │   └── hla_sequences.json              # HLA 伪序列（34 aa，NetMHCpan 格式）
 │
 ├── data/
 │   ├── Cleaned_data.py                 # IEDB 原始数据清洗（人类，Homo sapiens）
 │   ├── Cleaned_data_mouse.py           # IEDB 原始数据清洗（小鼠，Mus musculus）
-│   ├── preprocess_data.py              # 清洗结果整合，输出 Mode 系统标准 TSV
+│   ├── preprocess_data.py              # 清洗结果整合，输出标准 TSV
 │   ├── data_statistics.py              # 清洗结果统计分析
 │   ├── human_proteome.fasta            # UniProt 人类蛋白质组（用于负样本采样）
 │   └── negative_samples/               # 负样本缓存
 │
 ├── scripts/
-│   ├── train_mode1.py                  # 端到端训练：Mode 1（仅 HLA）
-│   ├── train_mode2.py                  # 端到端训练：Mode 2（HLA×Tissue）
-│   ├── train_mode1_with_mode2_splits.py  # 在 Mode 2 划分上重训 Mode 1（公平对比）
-│   ├── evaluate_per_task.py            # 逐任务评估（Mode 2，含 tissue 分层）
-│   ├── evaluate_mode1_simple.py        # 逐任务评估（Mode 1）
-│   ├── evaluate_mode2_simple.py        # 逐任务评估（Mode 2，含 tissue 汇总）
-│   ├── evaluate_mixmhcpred.py          # 基线：MixMHCpred 2.2
+│   ├── train_mode2.py                  # 端到端训练：HistoNeo w/ Tissue
+│   ├── train_mode1.py                  # 端到端训练：HistoNeo w/o Tissue（独立）
+│   ├── train_mode1_with_mode2_splits.py  # 在 w/ Tissue 划分上重训 w/o Tissue（公平消融对比）
+│   ├── evaluate_per_task.py            # 逐任务评估（w/ Tissue，含 tissue 分层）
+│   ├── evaluate_mode1_simple.py        # 逐任务评估（w/o Tissue）
+│   ├── evaluate_mode2_simple.py        # 逐任务评估（w/ Tissue，含 tissue 汇总）
+│   ├── evaluate_mixmhcpred.py          # 基线：MixMHCpred 3.0
 │   ├── evaluate_mhcflurry.py           # 基线：MHCflurry 2.0
-│   └── evaluate_mhcnuggets.py          # 基线：MHCnuggets
+│   └── evaluate_netmhcpan.py           # 基线：NetMHCpan 4.2c
 │
 ├── src/
 │   ├── config/
@@ -95,20 +114,20 @@ HNeo/
 │   │
 │   ├── models/
 │   │   ├── full_model.py               # ImmuneAppModel：FiLM 融合，模式感知前向传播
-│   │   ├── peptide_encoder.py          # 氨基酸编码器
-│   │   ├── task_gnn.py                 # HLA 任务图 GNN
+│   │   ├── peptide_encoder.py          # CNN + BiLSTM 肽段编码器
+│   │   ├── task_gnn.py                 # HLA 任务图 GCN
 │   │   └── predictor.py               # 任务条件化 MLP 预测器
 │   │
 │   ├── graph/
-│   │   └── task_graph.py              # HLA 相似性图构建
+│   │   └── task_graph.py              # HLA 伪序列一致性图构建
 │   │
 │   ├── training/
-│   │   ├── unified_trainer.py         # 主训练循环（标准 + 任务均衡采样）
+│   │   ├── unified_trainer.py         # 主训练循环（标准 + 自适应任务均衡采样）
 │   │   ├── per_task_evaluator.py      # 逐任务指标，tissue 分层汇总
-│   │   └── maml.py                    # MAML 训练器（遗留模块，当前已禁用）
+│   │   └── maml.py                    # MAML 训练器（已评估，当前未启用）
 │   │
 │   └── docs/
-│       └── MIGRATION_GUIDE.md         # Mode 1 → Mode 2 代码迁移说明
+│       └── MIGRATION_GUIDE.md         # 代码迁移说明
 │
 └── README.md
 ```
@@ -117,15 +136,15 @@ HNeo/
 
 ## 安装
 
-**环境要求**：Python 3.11，PyTorch 2.0，CUDA 11.8+
+**环境要求**：Python ≥ 3.9，PyTorch ≥ 2.0，CUDA 11.8+
 
 ```bash
 # 克隆仓库
-git clone https://github.com/<your-username>/HNeo.git
-cd HNeo
+git clone https://github.com/<your-username>/HistoNeo.git
+cd HistoNeo
 
 # 创建虚拟环境
-python3.11 -m venv venv
+python -m venv venv
 source venv/bin/activate
 
 # 安装依赖
@@ -162,63 +181,116 @@ python data/Cleaned_data.py
 python data/Cleaned_data_mouse.py
 ```
 
-结果输出至 `cleaned_data_mouse/`。
-
 ### 第一步（续）— 统计分析（可选）
 
 ```bash
 python data/data_statistics.py
 ```
 
-读取 `cleaned_data/` 中的分块文件，打印 HLA 分布、肽段长度分布、组织分布等统计信息，并保存 `data_statistics.json`。
-
 ### 第二步 — 数据整合与格式转换
 
-将清洗后的分块数据整合为 Mode 训练脚本所需的标准 TSV 格式。
-
-**Mode 1（HLA-only）**：
+将清洗后的分块数据整合为训练脚本所需的标准 TSV 格式：
 
 ```bash
-python data/preprocess_data.py --positive_dir cleaned_data --output_file data/mode1_data.tsv --mode mode1
+python data/preprocess_data.py \
+    --positive_dir cleaned_data \
+    --output_file data/mode2_data.tsv \
+    --mode mode2 \
+    --tissue_source Inferred_Tissue
 ```
 
-**Mode 2（HLA×Tissue）**：
+输出列为 `peptide`、`hla`、`tissue`、`label`，以及用于负样本配对采样的 `UniProt_ID`、`Epitope_Start`、`Epitope_End`。
+
+### 第三步 — 训练 HistoNeo w/ Tissue（完整模型）
 
 ```bash
-python data/preprocess_data.py --positive_dir cleaned_data --output_file data/mode2_data.tsv --mode mode2 --tissue_source Inferred_Tissue
+python scripts/train_mode2.py \
+    --data_file data/mode2_data.tsv \
+    --tissue_source Host \
+    --proteome_file data/human_proteome.fasta \
+    --output_dir output/mode2_experiment \
+    --hla_sequences configs/hla_sequences.json \
+    --min_samples 10 \
+    --min_samples_for_split 10 \
+    --negative_ratio 10 \
+    --n_epochs 50 \
+    --batch_size 256 \
+    --meta_lr 0.001 \
+    --graph_threshold 0.3 \
+    --save_negative_cache
 ```
 
-该步骤自动检测 tissue 列可用性，输出适用性诊断（tissue 类型数量、HLA×Tissue 组合数、建议的 `--min_samples` 参数），并去除重复样本。输出列为 `peptide`、`hla`、`label`（Mode 2 额外包含 `tissue`），以及用于负样本配对采样的 `UniProt_ID`、`Epitope_Start`、`Epitope_End`。
+### 第四步 — 训练 HistoNeo w/o Tissue（消融基线）
 
-### 第三步 — 训练 Mode 1（HLA-Only 基线）
-
-```bash
-python scripts/train_mode1.py --data_file data/mode1_data.tsv --output_dir outputs/mode1 --hla_sequences configs/hla_sequences.json --n_epochs 30 --batch_size 256 --min_samples 20 --negative_ratio 20 --use_task_balanced --use_negative_cache
-```
-
-### 第四步 — 训练 Mode 2（HLA × Tissue）
+为确保公平对比，w/o Tissue 在与 w/ Tissue **完全相同的数据划分**上重训：
 
 ```bash
-python scripts/train_mode2.py --data_file data/mode2_data.tsv --output_dir outputs/mode2 --hla_sequences configs/hla_sequences.json --tissue_source Host --n_epochs 30 --batch_size 256 --min_samples 10 --negative_ratio 20 --use_task_balanced --use_negative_cache
+python scripts/train_mode1_with_mode2_splits.py \
+    --mode2_output_dir output/mode2_experiment \
+    --output_dir output/mode1_ablation \
+    --proteome_file data/human_proteome.fasta \
+    --negative_ratio 10 \
+    --n_epochs 50 \
+    --batch_size 256 \
+    --meta_lr 0.001
 ```
 
 ### 第五步 — 评估
 
 ```bash
-# 逐任务评估（Mode 2，含 tissue 分层）
-python scripts/evaluate_per_task.py --output_dir outputs/mode2 --data_file data/mode2_data.tsv --tissue_source Inferred_Tissue
+# 逐任务评估（w/ Tissue，含 tissue 分层）
+python scripts/evaluate_per_task.py \
+    --checkpoint output/mode2_experiment/best_model.pt \
+    --data_file data/mode2_data.tsv \
+    --output_dir output/mode2_experiment/evaluation
 
-# 基线对比：MixMHCpred 2.2
-python scripts/evaluate_mixmhcpred.py --test_file data/mode1_data.tsv --mode1_output_dir outputs/mode1 --mixmhcpred_dir /path/to/MixMHCpred --output_dir outputs/mixmhcpred_eval --use_negative_cache
+# 基线对比：MixMHCpred 3.0
+python scripts/evaluate_mixmhcpred.py \
+    --test_file output/mode2_experiment/data_splits/test.tsv \
+    --mode1_output_dir output/mode1_ablation \
+    --mixmhcpred_dir /path/to/MixMHCpred \
+    --output_dir output/baselines/mixmhcpred \
+    --negative_ratio 10 \
+    --use_negative_cache
+
+# 基线对比：MHCflurry 2.0
+python scripts/evaluate_mhcflurry.py \
+    --test_file output/mode2_experiment/data_splits/test.tsv \
+    --output_dir output/baselines/mhcflurry \
+    --negative_ratio 10
 ```
 
-### Mode 1 vs. Mode 2 公平对比
-
-为确保公平对比，Mode 1 应在与 Mode 2 **完全相同的数据划分**上重训：
+### 小鼠模型训练
 
 ```bash
-python scripts/train_mode1_with_mode2_splits.py --data_file data/mode2_data.tsv --mode2_output_dir outputs/mode2 --output_dir outputs/mode1_on_mode2_splits --n_epochs 30
+python scripts/train_mode2.py \
+    --data_file data/mouse_mode2_data.tsv \
+    --tissue_source Host \
+    --proteome_file data/mouse_proteome.fasta \
+    --output_dir output/mouse_mode2 \
+    --min_samples 10 \
+    --min_samples_for_split 10 \
+    --negative_ratio 10 \
+    --n_epochs 50 \
+    --batch_size 256 \
+    --meta_lr 0.001
 ```
+
+---
+
+## 训练参数
+
+| 参数 | 值 | 说明 |
+|:-----|:--:|:-----|
+| `min_samples` | 10 | 每个任务最少正样本数 |
+| `negative_ratio` | 10 | 阴性:阳性采样比例 |
+| `n_epochs` | 50 | 训练轮数 |
+| `batch_size` | 256 | 批大小 |
+| `meta_lr` | 1×10⁻³ | Adam 学习率 |
+| `graph_threshold` | 0.3 | 图边权剪枝阈值 |
+| `dropout` | 0.3 | Dropout 比例 |
+| GPU | NVIDIA RTX 4090 | 测试硬件 |
+| Framework | PyTorch 2.0 + PyG | 深度学习框架 |
 
 ---
 
@@ -226,33 +298,76 @@ python scripts/train_mode1_with_mode2_splits.py --data_file data/mode2_data.tsv 
 
 ### 负样本生成
 
-负样本通过**来源蛋白配对切割策略**生成（`EnhancedNegativeSampler`）：对每条正样本（肽段, HLA），从*同一来源蛋白*上随机切取等长片段作为负样本候选，并排除所有已知阳性序列。该策略的估计假阴性率约为 1–3%，与 ImmuneApp 2024 基准方法对齐。
+负样本通过**来源蛋白配对切割策略**生成（`EnhancedNegativeSampler`）：对每条正样本（肽段, HLA），从*同一来源蛋白*上随机切取等长片段作为负样本候选，并排除所有已知阳性序列。该策略的估计假阴性率约为 1–3%。
 
-默认负样本比例：**1:20**（阳性:阴性）。
+默认负样本比例：**10:1**（阴性:阳性），通过自适应任务均衡采样动态调整任务权重，防止主导任务（如 blood × HLA-A*02:01）垄断训练。
 
-### 数据划分与数据泄漏防护
+### 数据划分
 
-数据集按 HLA 类型分层，以 70/15/15 的比例划分为训练/验证/测试集。在划分后执行去重步骤，移除同时出现在训练集和验证集中的（肽段, HLA）对（可能带有不同 tissue 标签），防止 HLA × Tissue 行级分层时产生的隐式数据泄漏。该方案优于直接按组划分，可与使用相同阳性样本训练的基线方法保持可比性。
+数据集按 HLA×Tissue 组合分层，以 **80/10/10** 的比例划分为训练/验证/测试集（`random_state=42`）。划分前先过滤正样本数少于 `min_samples_for_split`（默认 10）的组合；划分后，`UnifiedTaskCreator` 再次过滤训练集中正样本不足 `min_samples`（默认 10）的任务。
 
 ### 任务定义
 
-- **Mode 1 任务**：每个 HLA 等位基因对应一个任务（最少 20 条样本）。
-- **Mode 2 任务**：每个（HLA 等位基因, 组织类型）组合对应一个任务（最少 10 条样本），未知组织的样本被排除。
+- **w/o Tissue 任务**：每个 HLA 等位基因对应一个任务。人类 142 个，小鼠 18 个。
+- **w/ Tissue 任务**：每个（HLA 等位基因, 组织类型）组合对应一个任务。人类 1,037 个（训练集过滤后），小鼠 89 个。
 
 ### HLA 任务图
 
-HLA 等位基因作为图的节点，边权重由 34 残基 BLOSUM50 编码伪序列的余弦相似度计算（NetMHCpan 规范）。在 GNN 消息传递前，通过相似度阈值对图进行稀疏化处理。
+HLA 等位基因作为图的节点，边权重由 34 残基伪序列的**位置一致性**计算：
+
+```
+sim(i, j) = (1/34) × Σ 𝟙[sₖ⁽ⁱ⁾ = sₖ⁽ʲ⁾]
+```
+
+对于 w/ Tissue 图，节点为 HLA×Tissue 组合，边权重为 HLA 相似度（权重 0.7）与组织共现频率（权重 0.3）的加权和。相似度低于 0.3 的边被剪枝。
+
+### MAML 元学习
+
+实验中评估了 MAML（Model-Agnostic Meta-Learning）作为替代训练策略，但标准 Adam 优化器结合 GNN 图拓扑在所有验证指标上持续优于 MAML 初始化，因此最终模型未启用 MAML。
 
 ---
 
 ## 基线方法
 
-HistoNeo 与以下方法进行对比：
+| 方法 | 版本 | 参考文献 |
+|:-----|:-----|:---------|
+| NetMHCpan | 4.2c | Reynisson et al., *Nucleic Acids Res.* 2020 |
+| MHCflurry | 2.0 | O'Donnell et al., *Cell Syst.* 2020 |
+| MixMHCpred | 3.0 | Tadros et al., 2025; Gfeller et al., 2023 |
 
-| 方法 | 参考文献 |
-|------|---------|
-| MixMHCpred 2.2 | Bassani-Sternberg et al. |
-| MHCflurry 2.0 | O'Donnell et al., *Cell Syst.* 2020 |
-| MHCnuggets | Shao et al., *Cancer Immunol. Res.* 2020 |
-| ImmuneApp | Xu et al., *Nat. Commun.* 2024 |
-| MHLAPre | Xu et al., *Brief. Bioinform.* 2024 |
+---
+
+## 可复现性
+
+所有实验均可从 IEDB 原始数据完整复现。训练流水线自动保存：
+
+- `data_splits/train.tsv`、`val.tsv`、`test.tsv` — 完整数据划分
+- `split_meta.json` — 划分元数据与配置
+- `tasks/` — 任务定义与映射
+- `best_model.pt` — 最优检查点（验证 AUROC 最高）
+- `training_history.json` — 逐 epoch 训练指标
+
+数据划分使用固定随机种子 `random_state=42`。
+
+---
+
+## 引用
+
+如在研究中使用 HistoNeo，请引用：
+
+```bibtex
+@article{histoneo2026,
+  title   = {HistoNeo: Tissue-Specific Prediction of HLA Class I Peptide
+             Presentation via Graph Neural Networks and Feature-wise
+             Linear Modulation},
+  author  = {Huang, Y. and others},
+  year    = {2026},
+  note    = {Manuscript in preparation}
+}
+```
+
+---
+
+## 许可证
+
+本项目基于 MIT 许可证开源。详见 [LICENSE](LICENSE)。
