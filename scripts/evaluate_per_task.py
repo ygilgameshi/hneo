@@ -91,7 +91,7 @@ def main(args):
     print(f"    Mode: {config.task_type_name}")
     print(f"    Negative ratio: {config.negative_ratio}")
 
-    # ========== 4. 加载数据 ==========
+    # ========== 4. 加载数据（仅用于 fallback 负样本生成）==========
     print("\n" + "=" * 80)
     print("Step 4: 加载数据")
     print("=" * 80)
@@ -103,54 +103,40 @@ def main(args):
         args.tissue_source: 'tissue',
         'Label': 'label'
     })
-
     print(f"  ✓ 加载了 {len(df):,} 样本")
 
-    # ========== 5. 数据集划分 (和训练时完全一致) ==========
+    # ========== 5. 加载已有数据划分 ==========
     print("\n" + "=" * 80)
-    print("Step 5: 数据集划分")
+    print("Step 5: 加载数据划分")
     print("=" * 80)
 
-    from sklearn.model_selection import train_test_split
+    splits_dir = output_dir / 'data_splits'
+    if not splits_dir.exists() and args.mode2_ref_dir:
+        splits_dir = Path(args.mode2_ref_dir) / 'data_splits'
+        print(f"  ⚠  ablation 目录无 data_splits/，使用: {splits_dir}")
 
-    pos_df = df[df['label'] == 1]
+    if splits_dir.exists():
+        train_df = pd.read_csv(splits_dir / 'train.tsv', sep='\t')
+        val_df = pd.read_csv(splits_dir / 'val.tsv', sep='\t')
+        test_df = pd.read_csv(splits_dir / 'test.tsv', sep='\t')
+        for _df in [train_df, val_df, test_df]:
+            _df.rename(columns={
+                'MHC_Restriction_Name': 'hla',
+                'Peptide': 'peptide',
+                args.tissue_source: 'tissue',
+                'Label': 'label'
+            }, inplace=True)
+        print(f"  ✓ 从 {splits_dir} 加载（与训练完全一致）")
+    else:
+        print(f"  ⚠  未找到 data_splits/，使用全部数据作为 test（不推荐）")
+        pos_df = df[df['label'] == 1].copy()
+        train_df = pos_df
+        val_df = pos_df
+        test_df = pos_df
 
-    try:
-        train_df, temp_df = train_test_split(
-            pos_df,
-            test_size=0.3,
-            random_state=42,
-            stratify=pos_df['hla']
-        )
-
-        val_df, test_df = train_test_split(
-            temp_df,
-            test_size=0.5,
-            random_state=42,
-            stratify=temp_df['hla']
-        )
-
-        print(f"  ✓ 分层Split成功")
-
-    except Exception as e:
-        print(f"  ⚠️  分层split失败: {e}")
-        print(f"  使用简单split...")
-
-        train_df, temp_df = train_test_split(
-            pos_df,
-            test_size=0.3,
-            random_state=42
-        )
-
-        val_df, test_df = train_test_split(
-            temp_df,
-            test_size=0.5,
-            random_state=42
-        )
-
-    print(f"  Train: {len(train_df):,} 阳性样本")
-    print(f"  Val: {len(val_df):,} 阳性样本")
-    print(f"  Test: {len(test_df):,} 阳性样本")
+    print(f"  Train: {(train_df['label']==1).sum():,} 阳性")
+    print(f"  Val:   {(val_df['label']==1).sum():,} 阳性")
+    print(f"  Test:  {(test_df['label']==1).sum():,} 阳性")
 
     # ========== 6. 加载TaskManager ==========
     print("\n" + "=" * 80)
@@ -166,7 +152,7 @@ def main(args):
     all_tasks = task_manager.get_all_tasks()
     print(f"  ✓ 加载了 {len(all_tasks)} tasks")
 
-    # ========== 7. 生成/加载test set负样本 (支持缓存) ==========
+    # ========== 7. 生成/加载test set负样本 ==========
     print("\n" + "=" * 80)
     print("Step 7: 生成/加载Test set负样本")
     print("=" * 80)
@@ -174,55 +160,52 @@ def main(args):
     from src.data.negative_cache import NegativeSampleCache
 
     cache = NegativeSampleCache('data/negative_samples')
-
-    # 准备缓存配置（已移除 use_tissue_aware_negatives）
     cache_config = {
         'negative_ratio': mode_config_dict.get('negative_ratio', 10),
-        'min_samples': mode_config_dict.get('min_samples', 10),
-        'tissue_source': args.tissue_source
+        'min_samples':    mode_config_dict.get('min_samples', 10),
+        'tissue_source':  args.tissue_source,
     }
+    print(f"  negative_ratio: {cache_config['negative_ratio']}")
 
-    print(f"  缓存配置:")
-    print(f"    negative_ratio: {cache_config['negative_ratio']}")
+    # cache key 用 output_dir（与训练时一致），不用 data_file
+    cache_key_dir = str(output_dir)
+    cached_data = cache.load(cache_key_dir, 'mode2', cache_config)
 
-    # 尝试加载缓存
-    print(f"  尝试加载缓存...")
-    cached_data = cache.load(args.data_file, 'mode2', cache_config)
+    if cached_data is None:
+        # 尝试完整模型缓存（消融变体复用）
+        mode2_dir = args.mode2_ref_dir if hasattr(args, 'mode2_ref_dir') and args.mode2_ref_dir else None
+        if mode2_dir:
+            cached_data = cache.load(mode2_dir, 'mode2', cache_config)
+            if cached_data is not None:
+                print(f"  🚀 使用完整模型缓存: {mode2_dir}")
 
     if cached_data is not None:
         _, _, test_task_datasets = cached_data
-        print(f"  🚀 使用缓存的负样本!")
-        print(f"    Test tasks: {len(test_task_datasets)}")
+        print(f"  ✓ 缓存加载成功，Test tasks: {len(test_task_datasets)}")
     else:
-        print(f"  ⚙️  缓存未找到，生成新的负样本...")
-
+        print(f"  ⚙️  缓存未找到，实时生成负样本...")
         test_sampler = EnhancedNegativeSampler(config, test_df)
         test_task_datasets = {}
-
         for task_id, task in all_tasks.items():
             task_test_df = test_df[
                 (test_df['hla'] == task.hla) &
                 (test_df['tissue'] == task.tissue)
             ]
-
             if len(task_test_df) > 0:
                 positive_peptides = list(task_test_df['peptide'])
                 negative_peptides = test_sampler.generate_negatives_for_task(
-                    task,
-                    positive_peptides
+                    task, positive_peptides
                 )
-
                 neg_df = pd.DataFrame({
                     'peptide': negative_peptides,
-                    'hla': task.hla,
-                    'tissue': task.tissue,
-                    'label': 0
+                    'hla':     task.hla,
+                    'tissue':  task.tissue,
+                    'label':   0
                 })
-
-                task_test_combined = pd.concat([task_test_df, neg_df], ignore_index=True)
-                test_task_datasets[task_id] = task_test_combined
-
-        print(f"  ✓ 生成了 {len(test_task_datasets)} 个test tasks")
+                test_task_datasets[task_id] = pd.concat(
+                    [task_test_df, neg_df], ignore_index=True
+                )
+        print(f"  ✓ 生成了 {len(test_task_datasets)} 个 test tasks")
 
     # 统计
     total_test_samples = sum(len(df) for df in test_task_datasets.values())
@@ -269,10 +252,26 @@ def main(args):
 
     n_tissues = len(set(task.tissue for task in all_tasks.values()))
 
+    # 读取消融 flags（普通模型默认 True/True）
+    import json
+    ablation_info_path = output_dir / 'ablation_info.json'
+    use_gnn  = True
+    use_film = True
+    if ablation_info_path.exists():
+        with open(ablation_info_path) as f:
+            ab = json.load(f)
+        use_gnn  = ab.get('use_gnn',  True)
+        use_film = ab.get('use_film', True)
+        print(f"  消融模式: use_gnn={use_gnn}, use_film={use_film}")
+    else:
+        print(f"  标准模式: use_gnn={use_gnn}, use_film={use_film}")
+
     model = ImmuneAppModel(
         mode_config=config,
         n_tasks=len(all_tasks),
-        n_tissues=n_tissues
+        n_tissues=n_tissues,
+        use_gnn=use_gnn,
+        use_film=use_film,
     )
 
     model.load_state_dict(checkpoint['model_state_dict'])
@@ -324,9 +323,11 @@ if __name__ == '__main__':
     parser.add_argument('--output_dir', type=str, required=True,
                         help='训练输出目录 (包含best_model.pt)')
     parser.add_argument('--data_file', type=str, required=True,
-                        help='数据文件路径')
+                        help='原始数据文件路径（用于 fallback 负样本生成）')
     parser.add_argument('--tissue_source', type=str, default='Host',
                         help='Tissue列名')
+    parser.add_argument('--mode2_ref_dir', type=str, default=None,
+                        help='完整模型输出目录（消融实验复用其负样本缓存）')
     parser.add_argument('--visualize', action='store_true',
                         help='是否生成可视化')
 
