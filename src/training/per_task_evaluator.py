@@ -70,7 +70,13 @@ class PerTaskEvaluator:
                 # 移动到device
                 batch = {k: v.to(self.device) if torch.is_tensor(v) else v 
                         for k, v in batch.items()}
-                
+
+                # 在 evaluate_dataloader 里，model forward 之前加
+                if batch['peptide_len'].dim() == 0:
+                    batch['peptide_len'] = batch['peptide_len'].unsqueeze(0)
+                if batch['peptide'].dim() == 1:
+                    batch['peptide'] = batch['peptide'].unsqueeze(0)
+
                 # 前向传播
                 logits = self.model(batch, graph_data)
                 probs = torch.sigmoid(logits).cpu().numpy()

@@ -577,7 +577,9 @@ def train_model(
         'vocab_size': 21,
         'peptide_output_dim': kwargs.get('peptide_dim', 64),
         'task_output_dim': kwargs.get('task_dim', 64),
-        'dropout': kwargs.get('dropout', 0.1)
+        'dropout': kwargs.get('dropout', 0.1),
+        'use_gnn': kwargs.get('use_gnn', True),  # ← 新增
+        'use_film': kwargs.get('use_film', True),  # ← 新增
     }
 
     # Mode 2需要n_tissues
