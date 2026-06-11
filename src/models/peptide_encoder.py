@@ -111,7 +111,7 @@ class PeptideEncoder(nn.Module):
             # Pack sequence (处理变长序列)
             x = nn.utils.rnn.pack_padded_sequence(
                 x,
-                peptide_len.cpu(),
+                peptide_len.cpu().reshape(-1),
                 batch_first=True,
                 enforce_sorted=False
             )
